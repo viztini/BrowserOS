@@ -3,12 +3,13 @@
 
 from pathlib import Path
 from typing import Optional
+import re
 
 import typer
 
 from ..common.context import Context
-from ..common.module import ValidationError
-from ..common.utils import log_info, log_error, log_success
+from ..common.module import Module, ValidationError
+from ..common.utils import log_info, log_error
 
 from ..modules.release import (
     AVAILABLE_MODULES,
@@ -19,13 +20,14 @@ from ..modules.release import (
     DownloadModule,
 )
 
+SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
 app = typer.Typer(
     help="Release automation commands",
     pretty_exceptions_enable=False,
     pretty_exceptions_show_locals=False,
 )
 
-# GitHub sub-app for complex operations
 github_app = typer.Typer(
     help="GitHub release operations",
     pretty_exceptions_enable=False,
@@ -34,14 +36,16 @@ github_app = typer.Typer(
 app.add_typer(github_app, name="github")
 
 
-def create_release_context(
-    version: str,
-    repo: Optional[str] = None,
-) -> Context:
-    """Create Context for release operations"""
+def validate_version(version: str) -> None:
+    if not SEMVER_RE.match(version):
+        log_error(f"Invalid version '{version}' - expected format: MAJOR.MINOR.PATCH (e.g. 0.31.0)")
+        raise typer.Exit(1)
+
+
+def create_release_context(version: str, repo: Optional[str] = None) -> Context:
+    """Create a Context scoped to release operations."""
     ctx = Context(
         root_dir=Path.cwd(),
-        chromium_src=Path.cwd(),  # Not used for release ops
         architecture="",
         build_type="release",
     )
@@ -50,17 +54,29 @@ def create_release_context(
     return ctx
 
 
-def execute_module(ctx: Context, module) -> None:
-    """Execute a single module with validation"""
+def execute_module(ctx: Context, module: Module) -> None:
+    """Validate then execute a module, exiting on any failure."""
     try:
         module.validate(ctx)
-        module.execute(ctx)
     except ValidationError as e:
         log_error(f"Validation failed: {e}")
         raise typer.Exit(1)
+
+    try:
+        module.execute(ctx)
     except Exception as e:
-        log_error(f"Module failed: {e}")
+        log_error(f"Module '{type(module).__name__}' failed: {e}")
         raise typer.Exit(1)
+
+
+@app.command("modules")
+def show_modules() -> None:
+    """List all available release modules."""
+    log_info("Available release modules:")
+    log_info("-" * 50)
+    for name, module_class in AVAILABLE_MODULES.items():
+        log_info(f"  {name}: {module_class.description}")
+    log_info("-" * 50)
 
 
 @app.callback(invoke_without_command=True)
@@ -87,81 +103,61 @@ def main(
     output: Optional[Path] = typer.Option(
         None, "--output", "-o", help="Output directory for downloads (default: temp dir)"
     ),
-    show_modules: bool = typer.Option(
-        False, "--show-modules", help="Show available modules and exit"
-    ),
 ):
-    """Release automation for BrowserOS
+    """Release automation for BrowserOS.
 
     \b
-    Quick Operations (Flags):
-      browseros release --list                        # List all available versions
-      browseros release --list --version 0.31.0       # List artifacts for version
-      browseros release --version 0.31.0 --appcast    # Generate appcast XML
-      browseros release --version 0.31.0 --publish    # Publish to download/ paths
-      browseros release --version 0.31.0 --download   # Download all artifacts
-      browseros release --version 0.31.0 --download --os macos  # Download macOS only
-      browseros release --version 0.31.0 --download --output ./downloads  # Custom dir
+    Quick Operations:
+      browseros release --list                                         # List all available versions
+      browseros release --list --version 0.31.0                       # List artifacts for version
+      browseros release --version 0.31.0 --appcast                    # Generate appcast XML
+      browseros release --version 0.31.0 --publish                    # Publish to download/ paths
+      browseros release --version 0.31.0 --download                   # Download all artifacts
+      browseros release --version 0.31.0 --download --os macos        # Download macOS only
+      browseros release --version 0.31.0 --download --output ./dist   # Custom output dir
 
     \b
-    GitHub Release (Sub-command):
+    GitHub Release:
       browseros release github create --version 0.31.0
       browseros release github create --version 0.31.0 --publish
 
     \b
-    Show Available Modules:
-      browseros release --show-modules
+    List Modules:
+      browseros release modules
     """
-    if show_modules:
-        log_info("\n📦 Available Release Modules:")
-        log_info("-" * 50)
-        for name, module_class in AVAILABLE_MODULES.items():
-            log_info(f"  {name}: {module_class.description}")
-        log_info("-" * 50)
-        return
-
-    # If subcommand invoked, let it handle things
     if ctx.invoked_subcommand is not None:
         return
 
-    # Check if any flags specified
-    has_flags = any([list_artifacts, appcast, publish, download])
-
+    has_flags = any((list_artifacts, appcast, publish, download))
     if not has_flags:
-        typer.echo(
-            "Error: Specify a flag (--list, --appcast, --publish, --download) or use a sub-command\n"
-        )
-        typer.echo("Use --help for usage information")
-        typer.echo("Use --show-modules to see available modules")
+        typer.echo("Error: specify a flag (--list, --appcast, --publish, --download) or a sub-command.")
+        typer.echo("Run --help for usage, or 'browseros release modules' to list available modules.")
         raise typer.Exit(1)
 
-    # Version is required for all flags except --list
-    requires_version = any([appcast, publish, download])
+    requires_version = any((appcast, publish, download))
     if requires_version and not version:
-        log_error("--version is required for this operation")
+        log_error("--version is required for --appcast, --publish, and --download")
         raise typer.Exit(1)
 
-    # Create context
+    if version:
+        validate_version(version)
+
     release_ctx = create_release_context(version or "")
 
-    # Execute requested modules
     if list_artifacts:
-        if version:
-            log_info(f"📋 Listing artifacts for v{version}")
-        else:
-            log_info("📋 Listing all available releases")
+        log_info(f"Listing artifacts for v{version}" if version else "Listing all available releases")
         execute_module(release_ctx, ListModule())
 
     if appcast:
-        log_info(f"📝 Generating appcast for v{version}")
+        log_info(f"Generating appcast for v{version}")
         execute_module(release_ctx, AppcastModule())
 
     if publish:
-        log_info(f"🚀 Publishing v{version} to download/ paths")
+        log_info(f"Publishing v{version} to download/ paths")
         execute_module(release_ctx, PublishModule())
 
     if download:
-        log_info(f"📥 Downloading artifacts for v{version}")
+        log_info(f"Downloading artifacts for v{version}")
         execute_module(release_ctx, DownloadModule(os_filter=os_filter, output_dir=output))
 
 
@@ -171,7 +167,7 @@ def github_create(
         ..., "--version", "-v", help="Version to release (e.g., 0.31.0)"
     ),
     draft: bool = typer.Option(
-        True, "--draft/--publish", help="Create as draft (default: draft)"
+        True, "--draft/--no-draft", help="Create as draft (default: true)"
     ),
     repo: Optional[str] = typer.Option(
         None, "--repo", "-r", help="GitHub repo (owner/name)"
@@ -186,26 +182,22 @@ def github_create(
         False, "--publish", "-p", help="Also publish to download/ paths after creating release"
     ),
 ):
-    """Create GitHub release from R2 artifacts
+    """Create a GitHub release from R2 artifacts.
 
     \b
     Examples:
       browseros release github create --version 0.31.0
-      browseros release github create --version 0.31.0 --publish  # Also publish to download/
-      browseros release github create --version 0.31.0 --no-draft # Create published release
+      browseros release github create --version 0.31.0 --publish
+      browseros release github create --version 0.31.0 --no-draft
     """
+    validate_version(version)
     ctx = create_release_context(version, repo)
 
-    log_info(f"🚀 Creating GitHub release for v{version}")
-    module = GithubModule(
-        draft=draft,
-        skip_upload=skip_upload,
-        title=title,
-    )
-    execute_module(ctx, module)
+    log_info(f"Creating GitHub release for v{version}")
+    execute_module(ctx, GithubModule(draft=draft, skip_upload=skip_upload, title=title))
 
     if publish_to_download:
-        log_info(f"\n🚀 Publishing v{version} to download/ paths")
+        log_info(f"Publishing v{version} to download/ paths")
         execute_module(ctx, PublishModule())
 
 
